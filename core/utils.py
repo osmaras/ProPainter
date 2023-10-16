@@ -8,7 +8,7 @@ import zipfile
 import math
 
 import torch
-import matplotlib
+#import matplotlib
 import matplotlib.patches as patches
 from matplotlib.path import Path
 from matplotlib import pyplot as plt

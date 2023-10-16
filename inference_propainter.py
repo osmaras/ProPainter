@@ -8,6 +8,11 @@ import scipy.ndimage
 from PIL import Image
 from tqdm import tqdm
 
+import timeit # for debug purposes
+
+import dask
+import dask.array as da    
+
 import torch
 import torchvision
 
@@ -15,6 +20,7 @@ from model.modules.flow_comp_raft import RAFT_bi
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from model.propainter import InpaintGenerator
 from utils.download_util import load_file_from_url
+
 from core.utils import to_tensors
 from model.misc import get_device
 
@@ -30,6 +36,7 @@ def imwrite(img, file_path, params=None, auto_mkdir=True):
     return cv2.imwrite(file_path, img, params)
 
 
+# TODO: add function to tile and untile frames
 # resize frames
 def resize_frames(frames, size=None):    
     if size is not None:
@@ -45,6 +52,7 @@ def resize_frames(frames, size=None):
     return frames, process_size, out_size
 
 
+# TODO: Change cv2 for ffmpeg (imageio plugin?) to write and read videos (ProRes support)
 #  read frames from video
 def read_frame_from_videos(frame_root):
     if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
@@ -173,82 +181,97 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
     return ref_index
 
 
-
-if __name__ == '__main__':
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = get_device()
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '-i', '--video', type=str, default='inputs/object_removal/bmx-trees', help='Path of the input video or image folder.')
-    parser.add_argument(
-        '-m', '--mask', type=str, default='inputs/object_removal/bmx-trees_mask', help='Path of the mask(s) or mask folder.')
-    parser.add_argument(
-        '-o', '--output', type=str, default='results', help='Output folder. Default: results')
-    parser.add_argument(
-        "--resize_ratio", type=float, default=1.0, help='Resize scale for processing video.')
-    parser.add_argument(
-        '--height', type=int, default=-1, help='Height of the processing video.')
-    parser.add_argument(
-        '--width', type=int, default=-1, help='Width of the processing video.')
-    parser.add_argument(
-        '--mask_dilation', type=int, default=4, help='Mask dilation for video and flow masking.')
-    parser.add_argument(
-        "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
-    parser.add_argument(
-        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
-    parser.add_argument(
-        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
-    parser.add_argument(
-        "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
-    parser.add_argument(
-        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_outpainting'], help="Modes: video_inpainting / video_outpainting")
-    parser.add_argument(
-        '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
-    parser.add_argument(
-        '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
-    parser.add_argument(
-        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
-    parser.add_argument(
-        '--save_frames', action='store_true', help='Save output frames. Default: False')
-    parser.add_argument(
-        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
-
-    args = parser.parse_args()
-
-    # Use fp16 precision during inference to reduce running memory cost
-    use_half = True if args.fp16 else False 
+def _is_numpy_image(img):
+    return isinstance(img, np.ndarray)
 
 
-    frames, fps, size, video_name = read_frame_from_videos(args.video)
-    if not args.width == -1 and not args.height == -1:
-        size = (args.width, args.height)
-    if not args.resize_ratio == 1.0:
-        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
+def NumpyToTensor(pic):
+    """
+    Convert a ``numpy.ndarray`` to tensor.
+    """
+    """
+    Args:
+        converts pic (numpy array) to Tensor
 
-    frames, size, out_size = resize_frames(frames, size)
-    
-    fps = args.save_fps if fps is None else fps
-    save_root = os.path.join(args.output, video_name)
-    if not os.path.exists(save_root):
-        os.makedirs(save_root, exist_ok=True)
+    Returns:
+        Tensor: Converted image.
+    """
 
+    # check type of [pic]
+    if not _is_numpy_image(pic):
+        raise TypeError('img should be numpy array. Got {}'.format(type(pic)))
+
+    if len(pic.shape) == 1: return torch.FloatTensor(pic.copy())
+
+    return torch.FloatTensor(pic.transpose((2, 0, 1)).copy())
+
+
+# function crop video into a list of tile videos without proces, call compute when needed later
+def tile_videos(frames,tile_size):
+    frames_len = len(frames)
+    tw, th = tile_size
+    tiles = []
+    video = []
+    for i in range(frames_len):
+        if type(frames[i]) is np.ndarray:
+            img = frames[i]
+        else:            
+            img = np.array(frames[i])
+        if len(img.shape)>2:            
+            img_tiles = da.from_array(img, chunks=(th, tw,3))
+        else:
+            img_tiles = da.from_array(img, chunks=(th, tw))
+        # frame = i
+        for block in img_tiles.blocks:
+            tiles.append(block)
+        video.append(tiles)
+        tiles = []
+
+    # create a video per tile (compute only for fast debugging)
+    videos = []
+    for i in range(len(video[0])):
+        videos.append([Image.fromarray(item[i].compute()) for item in video])
+        
+    return videos
+
+# to construct back the original size of video
+def untile_videos(videos_list,tile_size):
+    output = []
+    tw, th = tile_size
+    for i in range(len(videos_list[0])):
+        for tile in range(len(videos_list)):
+            tiles.append(videos_list[tile][i])
+        output.append(tiles)
+        tiles = []
+
+    tocompute = []
+    for i in range(len(output)):
+        if type(output[i][0]) is np.ndarray:
+            [da.from_array(item,chunks = (tw,th,3)) for item in output[i]]
+            # output[i] = da.from_array(output[i],chunks = (tw,th,3))
+        tocompute.append(da.concatenate(output[i], axis=0).compute())
+        cv2.imshow("Untiled",tocompute[i])
+        cv2.waitKey(1)
+    return tocompute
+
+
+# inference video
+def inference(framesin,size,flow_masks, masks_dilated):
     if args.mode == 'video_inpainting':
-        frames_len = len(frames)
-        flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
-                                              flow_mask_dilates=args.mask_dilation,
-                                              mask_dilates=args.mask_dilation)
+        frames_len = len(framesin)
+        
         w, h = size
+        # tw, th = tile_size #ojo
     elif args.mode == 'video_outpainting':
         assert args.scale_h is not None and args.scale_w is not None, 'Please provide a outpainting scale (s_h, s_w).'
-        frames, flow_masks, masks_dilated, size = extrapolation(frames, (args.scale_h, args.scale_w))
+        frames, flow_masks, masks_dilated, size = extrapolation(framesin, (args.scale_h, args.scale_w))
         w, h = size
     else:
         raise NotImplementedError
     
     # for saving the masked frames or video
     masked_frame_for_save = []
-    for i in range(len(frames)):
+    '''for i in range(len(frames)):
         mask_ = np.expand_dims(np.array(masks_dilated[i]),2).repeat(3, axis=2)/255.
         img = np.array(frames[i])
         green = np.zeros([h, w, 3]) 
@@ -257,10 +280,13 @@ if __name__ == '__main__':
         # alpha = 1.0
         fuse_img = (1-alpha)*img + alpha*green
         fuse_img = mask_ * fuse_img + (1-mask_)*img
-        masked_frame_for_save.append(fuse_img.astype(np.uint8))
+        masked_frame_for_save.append(fuse_img.astype(np.uint8))'''
 
-    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
+    frames_inp = [np.array(f).astype(np.uint8) for f in framesin]
+
+    # video_tiles = [da.from_array(t, chunks=(th, tw)) for t in frames]
+    
+    frames = to_tensors()(framesin).unsqueeze(0) * 2 - 1    
     flow_masks = to_tensors()(flow_masks).unsqueeze(0)
     masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
     frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
@@ -294,6 +320,8 @@ if __name__ == '__main__':
     ##############################################
     # ProPainter inference
     ##############################################
+    # TODO: add tiling callings
+
     video_length = frames.size(1)
     print(f'\nProcessing: {video_name} [{video_length} frames]...')
     with torch.no_grad():
@@ -458,16 +486,114 @@ if __name__ == '__main__':
             f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
             img_save_root = os.path.join(save_root, 'frames', str(idx).zfill(4)+'.png')
             imwrite(f, img_save_root)
-                    
+
+    return comp_frames                    
 
     # if args.mode == 'video_outpainting':
     #     comp_frames = [i[10:-10,10:-10] for i in comp_frames]
     #     masked_frame_for_save = [i[10:-10,10:-10] for i in masked_frame_for_save]
     
+if __name__ == '__main__':
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-i', '--video', type=str, default='inputs/object_removal/bmx-trees', help='Path of the input video or image folder.')
+    parser.add_argument(
+        '-m', '--mask', type=str, default='inputs/object_removal/bmx-trees_mask', help='Path of the mask(s) or mask folder.')
+    parser.add_argument(
+        '-o', '--output', type=str, default='results', help='Output folder. Default: results')
+    parser.add_argument(
+        "--resize_ratio", type=float, default=1.0, help='Resize scale for processing video.')
+    parser.add_argument(
+        '--height', type=int, default=-1, help='Height of the processing video.')
+    parser.add_argument(
+        '--width', type=int, default=-1, help='Width of the processing video.')
+    parser.add_argument(
+        '--mask_dilation', type=int, default=4, help='Mask dilation for video and flow masking.')
+    parser.add_argument(
+        "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
+    parser.add_argument(
+        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
+    parser.add_argument(
+        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
+    parser.add_argument(
+        "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
+    parser.add_argument(
+        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_outpainting'], help="Modes: video_inpainting / video_outpainting")
+    parser.add_argument(
+        '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
+    parser.add_argument(
+        '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
+    parser.add_argument(
+        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
+    parser.add_argument(
+        '--save_frames', action='store_true', help='Save output frames. Default: False')
+    parser.add_argument(
+        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
+    parser.add_argument(
+        '-t', '--tiles', action='store_true', help='Use tiling for reduce the imagesize')
+    parser.add_argument(
+        '--tile_div', type=int, default= 2, help='Image divisor for tiling ')
+    args = parser.parse_args()
+
+    # Use fp16 precision during inference to reduce running memory cost
+    use_half = True if args.fp16 else False 
+
+    # TODO: add condition for tiling
+    use_tiles =  True if args.tiles else False
+    tile_div = args.tile_div  #if args.tile_div else 4
+
+    frames, fps, size, video_name = read_frame_from_videos(args.video)
+    if not args.width == -1 and not args.height == -1:
+        size = (args.width, args.height)
+    if not args.resize_ratio == 1.0:
+        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
+
+    frames, size, out_size = resize_frames(frames, size)
+    
+    fps = args.save_fps if fps is None else fps
+    save_root = os.path.join(args.output, video_name)
+    if not os.path.exists(save_root):
+        os.makedirs(save_root, exist_ok=True)
+
+    # Read mask from disk and create flow and dilated
+    frames_len = len(frames)
+    flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
+                                                flow_mask_dilates=args.mask_dilation,
+                                                mask_dilates=args.mask_dilation)
+    
+    # Create tiles for each frame of video (using dask to not proces until the end)
+    if (tile_div > 1) and use_tiles:      
+        # Create tiles for each frame of video (using dask to not proces until the end)\
+        print("tiling video...")
+        tile_size = (round(size[0]/tile_div), round(size[1]/tile_div))
+        print("tile div:  ", tile_div)
+        print("width: ",tile_size[0])
+        print("tile size:  ", tile_size)
+        video_tiles = tile_videos(frames,tile_size)
+        print("tiling flow masks...")
+        flow_masks_tiles = tile_videos(flow_masks,tile_size)
+        print("tiling flow masks dilated...")
+        masks_dilated_tiles = tile_videos(masks_dilated,tile_size)
+        comp_tiles = []
+        for i  in range(len(video_tiles)):
+            result = inference(video_tiles[i],tile_size,flow_masks_tiles[i],masks_dilated_tiles[i])
+            comp_tiles.append(result)      
+        comp_frames = untile_videos(comp_tiles,tile_size)
+    else:
+        comp_frames = inference(frames,size,flow_masks,masks_dilated)
+            
+
+            
+
+        
+    
     # save videos frame
-    masked_frame_for_save = [cv2.resize(f, out_size) for f in masked_frame_for_save]
+    # masked_frame_for_save = [cv2.resize(f, out_size) for f in masked_frame_for_save]
     comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
-    imageio.mimwrite(os.path.join(save_root, 'masked_in.mp4'), masked_frame_for_save, fps=fps, quality=7)
+    # imageio.mimwrite(os.path.join(save_root, 'masked_in.mp4'), masked_frame_for_save, fps=fps, quality=7)
     imageio.mimwrite(os.path.join(save_root, 'inpaint_out.mp4'), comp_frames, fps=fps, quality=7)
     
     print(f'\nAll results are saved in {save_root}')
